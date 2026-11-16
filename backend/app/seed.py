@@ -11,7 +11,8 @@ CREATE TABLE IF NOT EXISTS shifts (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
   keeper TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT '空闲'
+  status TEXT NOT NULL DEFAULT '空闲',
+  inflight_limit INTEGER NOT NULL DEFAULT 10 CHECK (inflight_limit > 0)
 );
 CREATE TABLE IF NOT EXISTS batches (
   id INTEGER PRIMARY KEY,
@@ -46,12 +47,34 @@ CREATE TABLE IF NOT EXISTS reconcile_reports (
   detail_json TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS capacity_prechecks (
+  id INTEGER PRIMARY KEY,
+  handover_id INTEGER NOT NULL UNIQUE REFERENCES handovers(id),
+  to_shift_id INTEGER NOT NULL REFERENCES shifts(id),
+  current_inflight INTEGER NOT NULL,
+  item_count INTEGER NOT NULL,
+  capacity_limit INTEGER NOT NULL,
+  headroom INTEGER NOT NULL,
+  decision TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
 """
+
+
+def _migrate(conn) -> None:
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(shifts)").fetchall()}
+    if "inflight_limit" not in cols:
+        conn.execute(
+            "ALTER TABLE shifts ADD COLUMN inflight_limit INTEGER NOT NULL DEFAULT 10"
+            " CHECK (inflight_limit > 0)"
+        )
 
 
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         n = conn.execute("SELECT COUNT(*) AS c FROM shifts").fetchone()["c"]
         if n:
             return
@@ -59,8 +82,8 @@ def init_db() -> None:
         data = json.loads(Path(seed_path).read_text(encoding="utf-8"))
         for s in data["shifts"]:
             conn.execute(
-                "INSERT INTO shifts(id, name, keeper, status) VALUES (?, ?, ?, ?)",
-                (s["id"], s["name"], s["keeper"], s["status"]),
+                "INSERT INTO shifts(id, name, keeper, status, inflight_limit) VALUES (?, ?, ?, ?, ?)",
+                (s["id"], s["name"], s["keeper"], s["status"], s.get("inflight_limit", 10)),
             )
         for b in data["batches"]:
             conn.execute(

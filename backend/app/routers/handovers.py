@@ -16,9 +16,19 @@ def get_handovers():
     return svc.list_handovers()
 
 
+@router.get("/prechecks")
+def get_prechecks():
+    return svc.list_prechecks()
+
+
 @router.get("/{handover_id}")
 def get_one(handover_id: int):
     return svc.get_handover(handover_id)
+
+
+@router.get("/{handover_id}/precheck")
+def get_precheck(handover_id: int):
+    return svc.precheck_handover(handover_id)
 
 
 @router.post("/start")

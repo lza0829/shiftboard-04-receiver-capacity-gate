@@ -12,9 +12,49 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _inflight_count(conn, shift_id: int) -> int:
+    # 在途数一律从批次表同源派生；禁止另起容量计数器冒充批次表
+    return conn.execute(
+        "SELECT COUNT(*) AS c FROM batches WHERE owner_shift_id = ? AND status = '在途'",
+        (shift_id,),
+    ).fetchone()["c"]
+
+
 def list_shifts() -> list[dict]:
     with connect() as conn:
-        return rows_to_dicts(conn.execute("SELECT * FROM shifts ORDER BY id").fetchall())
+        rows = conn.execute(
+            """
+            SELECT s.*,
+                   (SELECT COUNT(*) FROM batches b
+                     WHERE b.owner_shift_id = s.id AND b.status = '在途') AS inflight
+            FROM shifts s
+            ORDER BY s.id
+            """
+        ).fetchall()
+        return rows_to_dicts(rows)
+
+
+def set_shift_capacity(shift_id: int, inflight_limit: int) -> dict:
+    if not isinstance(inflight_limit, int) or isinstance(inflight_limit, bool) or inflight_limit <= 0:
+        raise HTTPException(400, "在途容量上限必须是正整数")
+    with connect() as conn:
+        cur = conn.execute(
+            "UPDATE shifts SET inflight_limit = ? WHERE id = ?",
+            (inflight_limit, shift_id),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(404, "班次不存在")
+        row = conn.execute(
+            """
+            SELECT s.*,
+                   (SELECT COUNT(*) FROM batches b
+                     WHERE b.owner_shift_id = s.id AND b.status = '在途') AS inflight
+            FROM shifts s
+            WHERE s.id = ?
+            """,
+            (shift_id,),
+        ).fetchone()
+        return dict(row)
 
 
 def list_batches(owner_shift_id: int | None = None) -> list[dict]:
@@ -86,12 +126,96 @@ def get_handover(handover_id: int) -> dict:
         ).fetchall()
         out = dict(h)
         out["items"] = rows_to_dicts(items)
+        pre = conn.execute(
+            "SELECT * FROM capacity_prechecks WHERE handover_id = ?",
+            (handover_id,),
+        ).fetchone()
+        out["precheck"] = dict(pre) if pre else None
         return out
+
+
+def precheck_handover(handover_id: int) -> dict:
+    """容量预检：已落库则返回裁决报告，否则按当前批次表现算实时预览。"""
+    with connect() as conn:
+        h = conn.execute(
+            """
+            SELECT h.*, ts.name AS to_shift_name
+            FROM handovers h
+            JOIN shifts ts ON ts.id = h.to_shift_id
+            WHERE h.id = ?
+            """,
+            (handover_id,),
+        ).fetchone()
+        if not h:
+            raise HTTPException(404, "交班单不存在")
+        persisted = conn.execute(
+            "SELECT * FROM capacity_prechecks WHERE handover_id = ?",
+            (handover_id,),
+        ).fetchone()
+        if persisted:
+            p = dict(persisted)
+            return {
+                "handover_id": handover_id,
+                "to_shift_id": h["to_shift_id"],
+                "to_shift_name": h["to_shift_name"],
+                "当前在途": p["current_inflight"],
+                "本单键数": p["item_count"],
+                "上限": p["capacity_limit"],
+                "差值": p["headroom"],
+                "裁决": p["decision"],
+                "原因": p["reason"],
+                "已落库": True,
+            }
+        limit = conn.execute(
+            "SELECT inflight_limit FROM shifts WHERE id = ?",
+            (h["to_shift_id"],),
+        ).fetchone()["inflight_limit"]
+        current = _inflight_count(conn, h["to_shift_id"])
+        items = conn.execute(
+            "SELECT COUNT(*) AS c FROM handover_items WHERE handover_id = ?",
+            (handover_id,),
+        ).fetchone()["c"]
+        headroom = limit - current - items
+        return {
+            "handover_id": handover_id,
+            "to_shift_id": h["to_shift_id"],
+            "to_shift_name": h["to_shift_name"],
+            "当前在途": current,
+            "本单键数": items,
+            "上限": limit,
+            "差值": headroom,
+            "裁决": "预计通过" if headroom >= 0 else "预计拒绝",
+            "原因": "",
+            "已落库": False,
+        }
+
+
+def list_prechecks() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT p.*, s.name AS to_shift_name
+            FROM capacity_prechecks p
+            JOIN shifts s ON s.id = p.to_shift_id
+            ORDER BY p.id DESC
+            """
+        ).fetchall()
+        return rows_to_dicts(rows)
 
 
 def dashboard() -> dict:
     with connect() as conn:
-        shifts = rows_to_dicts(conn.execute("SELECT * FROM shifts ORDER BY id").fetchall())
+        shifts = rows_to_dicts(
+            conn.execute(
+                """
+                SELECT s.*,
+                       (SELECT COUNT(*) FROM batches b
+                         WHERE b.owner_shift_id = s.id AND b.status = '在途') AS inflight
+                FROM shifts s
+                ORDER BY s.id
+                """
+            ).fetchall()
+        )
         inflight = conn.execute(
             "SELECT COUNT(*) AS c FROM batches WHERE status = '在途'"
         ).fetchone()["c"]
@@ -149,73 +273,108 @@ def start_handover(from_shift_id: int, to_shift_id: int) -> dict:
 
 
 def complete_handover(handover_id: int) -> dict:
-    with connect() as conn:
+    conn = connect()
+    try:
+        # 同一失败闭：BEGIN IMMEDIATE 先拿写锁，预检与过户在同一事务内完成
+        conn.execute("BEGIN IMMEDIATE")
         h = conn.execute("SELECT * FROM handovers WHERE id = ?", (handover_id,)).fetchone()
         if not h:
             raise HTTPException(404, "交班单不存在")
         if h["status"] != "进行中":
             raise HTTPException(400, "只能完成进行中的交班单")
         items = conn.execute(
-            "SELECT batch_id FROM handover_items WHERE handover_id = ?",
+            "SELECT batch_id FROM handover_items WHERE handover_id = ? ORDER BY batch_id",
             (handover_id,),
         ).fetchall()
         before = len(items)
-        # 交班完成：整批过户，禁止只改交班单状态不改归属
+        limit = conn.execute(
+            "SELECT inflight_limit FROM shifts WHERE id = ?",
+            (h["to_shift_id"],),
+        ).fetchone()["inflight_limit"]
+        current_to = _inflight_count(conn, h["to_shift_id"])
+        headroom = limit - current_to - before
+        decision = "通过" if headroom >= 0 else "拒绝"
+        reason = "" if decision == "通过" else (
+            f"接班方在途容量超限：当前在途{current_to} + 本单{before}键 > 上限{limit}"
+            f"（差值{headroom}），整单拒绝、零过户"
+        )
+        # 容量裁决依据固化可查：独立预检报告表，按交班单 id 落库（与过户同事务）
+        conn.execute(
+            """
+            INSERT INTO capacity_prechecks(
+              handover_id, to_shift_id, current_inflight, item_count,
+              capacity_limit, headroom, decision, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                handover_id,
+                h["to_shift_id"],
+                current_to,
+                before,
+                limit,
+                headroom,
+                decision,
+                reason,
+                _now(),
+            ),
+        )
+        if decision == "拒绝":
+            # 先拒后改：零过户，禁止先过户再报超容、禁止超容静默成功
+            conn.execute(
+                "UPDATE handovers SET status = '已拒绝', reason = ?, finished_at = ? WHERE id = ?",
+                (reason, _now(), handover_id),
+            )
+            conn.execute("UPDATE shifts SET status = '值班中' WHERE id = ?", (h["from_shift_id"],))
+            conn.execute("UPDATE shifts SET status = '空闲' WHERE id = ?", (h["to_shift_id"],))
+            conn.commit()
+            return get_handover(handover_id)
+        # 裁决通过：同事务内整批过户，禁止只改交班单状态不改归属
         for it in items:
             conn.execute(
                 "UPDATE batches SET owner_shift_id = ? WHERE id = ? AND status = '在途'",
                 (h["to_shift_id"], it["batch_id"]),
             )
-        after_from = conn.execute(
-            "SELECT COUNT(*) AS c FROM batches WHERE owner_shift_id = ? AND status = '在途'",
-            (h["from_shift_id"],),
-        ).fetchone()["c"]
-        after_to = conn.execute(
-            "SELECT COUNT(*) AS c FROM batches WHERE owner_shift_id = ? AND status = '在途'",
-            (h["to_shift_id"],),
-        ).fetchone()["c"]
-        consistent = 1 if after_from == 0 and after_to >= before else 0
+        after_from = _inflight_count(conn, h["from_shift_id"])
+        after_to = _inflight_count(conn, h["to_shift_id"])
+        consistent = after_from == 0 and after_to == current_to + before
+        if not consistent or after_to > limit:
+            # 过户中途出现异常写入（归属不一致或超容）：整单回滚到完成前归属
+            conn.rollback()
+            raise HTTPException(409, "过户校验未通过（归属不一致或超容），已整单回滚到完成前归属")
+        conn.execute(
+            "UPDATE handovers SET status = '已完成', finished_at = ?, batch_count = ? WHERE id = ?",
+            (_now(), before, handover_id),
+        )
+        conn.execute("UPDATE shifts SET status = '已交班' WHERE id = ?", (h["from_shift_id"],))
+        conn.execute("UPDATE shifts SET status = '值班中' WHERE id = ?", (h["to_shift_id"],))
         detail = {
             "交班前在途数": before,
             "交班后交班方在途": after_from,
             "交班后接班方在途": after_to,
+            "接班方在途上限": limit,
         }
-        conn.execute(
-            """
-            UPDATE handovers
-            SET status = ?, finished_at = ?, batch_count = ?
-            WHERE id = ?
-            """,
-            ("已完成" if consistent else "失败", _now(), before, handover_id),
-        )
-        if consistent:
-            conn.execute("UPDATE shifts SET status = '已交班' WHERE id = ?", (h["from_shift_id"],))
-            conn.execute("UPDATE shifts SET status = '值班中' WHERE id = ?", (h["to_shift_id"],))
-        else:
-            conn.execute(
-                "UPDATE handovers SET reason = ? WHERE id = ?",
-                ("交班后批次归属与清单不一致", handover_id),
-            )
-            conn.execute("UPDATE shifts SET status = '值班中' WHERE id = ?", (h["from_shift_id"],))
-            conn.execute("UPDATE shifts SET status = '空闲' WHERE id = ?", (h["to_shift_id"],))
         conn.execute(
             """
             INSERT INTO reconcile_reports(
               handover_id, before_count, after_from_count, after_to_count,
               consistent, detail_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, 1, ?, ?)
             """,
             (
                 handover_id,
                 before,
                 after_from,
                 after_to,
-                consistent,
                 json.dumps(detail, ensure_ascii=False),
                 _now(),
             ),
         )
         conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     return get_handover(handover_id)
 
 

@@ -1,8 +1,8 @@
 {
   "shifts": [
-    {"id": 1, "name": "早班", "keeper": "阿陈", "status": "值班中"},
-    {"id": 2, "name": "晚班", "keeper": "小林", "status": "空闲"},
-    {"id": 3, "name": "夜班", "keeper": "老周", "status": "空闲"}
+    {"id": 1, "name": "早班", "keeper": "阿陈", "status": "值班中", "inflight_limit": 10},
+    {"id": 2, "name": "晚班", "keeper": "小林", "status": "空闲", "inflight_limit": 10},
+    {"id": 3, "name": "夜班", "keeper": "老周", "status": "空闲", "inflight_limit": 3}
   ],
   "batches": [
     {"id": 1, "biz_key": "B20261115-01", "title": "门店价目切片 A", "owner_shift_id": 1, "status": "在途", "note": "待核验"},

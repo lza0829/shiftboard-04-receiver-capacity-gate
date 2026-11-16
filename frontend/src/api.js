@@ -13,3 +13,13 @@ export async function postJson(url, body) {
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
+
+export async function putJson(url, body) {
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body ?? {}),
+  })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}

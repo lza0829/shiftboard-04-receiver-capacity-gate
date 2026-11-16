@@ -28,12 +28,13 @@ onMounted(async () => {
       <div class="panel">
         <h2>班次状态</h2>
         <table>
-          <thead><tr><th>班次</th><th>值班人</th><th>状态</th></tr></thead>
+          <thead><tr><th>班次</th><th>值班人</th><th>状态</th><th>在途/上限</th></tr></thead>
           <tbody>
             <tr v-for="s in data.班次" :key="s.id">
               <td>{{ s.name }}</td>
               <td>{{ s.keeper }}</td>
               <td><span class="tag" :class="{ on: s.status === '值班中' }">{{ s.status }}</span></td>
+              <td>{{ s.inflight }}/{{ s.inflight_limit }}</td>
             </tr>
           </tbody>
         </table>
